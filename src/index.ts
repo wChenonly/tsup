@@ -1,9 +1,9 @@
 import path from 'node:path'
 import fs from 'node:fs'
 import { Worker } from 'node:worker_threads'
-import glob from 'globby'
 import { loadTsConfig } from 'bundle-require'
-import execa from 'execa'
+import { exec, type Result as ExecChild } from 'tinyexec'
+import { glob, globSync } from 'tinyglobby'
 import kill from 'tree-kill'
 import { version } from '../package.json'
 import { PrettyError, handleError } from './errors'
@@ -12,8 +12,9 @@ import {
   type MaybePromise,
   debouncePromise,
   removeFiles,
+  resolveExperimentalDtsConfig,
+  resolveInitialExperimentalDtsConfig,
   slash,
-  toObjectEntry,
 } from './utils'
 import { createLogger, setSilent } from './log'
 import { runEsbuild } from './esbuild'
@@ -28,7 +29,6 @@ import { terserPlugin } from './plugins/terser'
 import { runTypeScriptCompiler } from './tsc'
 import { runDtsRollup } from './api-extractor'
 import { cjsInterop } from './plugins/cjs-interop'
-import type { ChildProcess } from 'node:child_process'
 import type { Format, KILL_SIGNAL, NormalizedOptions, Options } from './options'
 
 export type { Format, Options, NormalizedOptions }
@@ -93,20 +93,10 @@ const normalizeOptions = async (
         : typeof _options.dts === 'string'
           ? { entry: _options.dts }
           : _options.dts,
-    experimentalDts: _options.experimentalDts
-      ? typeof _options.experimentalDts === 'boolean'
-        ? _options.experimentalDts
-          ? { entry: {} }
-          : undefined
-        : typeof _options.experimentalDts === 'string'
-          ? {
-              entry: toObjectEntry(_options.experimentalDts),
-            }
-          : {
-              ..._options.experimentalDts,
-              entry: toObjectEntry(_options.experimentalDts.entry || {}),
-            }
-      : undefined,
+
+    experimentalDts: await resolveInitialExperimentalDtsConfig(
+      _options.experimentalDts,
+    ),
   }
 
   setSilent(options.silent)
@@ -152,17 +142,14 @@ const normalizeOptions = async (
         ...(options.dts.compilerOptions || {}),
       }
     }
+
     if (options.experimentalDts) {
-      options.experimentalDts.compilerOptions = {
-        ...(tsconfig.data.compilerOptions || {}),
-        ...(options.experimentalDts.compilerOptions || {}),
-      }
-      options.experimentalDts.entry = toObjectEntry(
-        Object.keys(options.experimentalDts.entry).length > 0
-          ? options.experimentalDts.entry
-          : options.entry,
+      options.experimentalDts = await resolveExperimentalDtsConfig(
+        options as NormalizedOptions,
+        tsconfig,
       )
     }
+
     if (!options.target) {
       options.target = tsconfig.data?.compilerOptions?.target?.toLowerCase()
     }
@@ -207,6 +194,13 @@ export async function build(_options: Options) {
           logger.info('CLI', 'Running in watch mode')
         }
 
+        const experimentalDtsTask = async () => {
+          if (!options.dts && options.experimentalDts) {
+            const exports = runTypeScriptCompiler(options)
+            await runDtsRollup(options, exports)
+          }
+        }
+
         const dtsTask = async () => {
           if (options.dts && options.experimentalDts) {
             throw new Error(
@@ -214,18 +208,25 @@ export async function build(_options: Options) {
             )
           }
 
-          if (options.experimentalDts) {
-            const exports = runTypeScriptCompiler(options)
-            await runDtsRollup(options, exports)
-          }
+          await experimentalDtsTask()
 
           if (options.dts) {
             await new Promise<void>((resolve, reject) => {
               const worker = new Worker(path.join(__dirname, './rollup.js'))
+
+              const terminateWorker = () => {
+                if (options.watch) return
+                worker.terminate()
+              }
+
               worker.postMessage({
                 configName: item?.name,
                 options: {
                   ...options, // functions cannot be cloned
+                  injectStyle:
+                    typeof options.injectStyle === 'function'
+                      ? undefined
+                      : options.injectStyle,
                   banner: undefined,
                   footer: undefined,
                   esbuildPlugins: undefined,
@@ -238,8 +239,10 @@ export async function build(_options: Options) {
               })
               worker.on('message', (data) => {
                 if (data === 'error') {
-                  reject(new Error('error occured in dts build'))
+                  terminateWorker()
+                  reject(new Error('error occurred in dts build'))
                 } else if (data === 'success') {
+                  terminateWorker()
                   resolve()
                 } else {
                   const { type, text } = data
@@ -256,7 +259,7 @@ export async function build(_options: Options) {
 
         const mainTasks = async () => {
           if (!options.dts?.only) {
-            let onSuccessProcess: ChildProcess | undefined
+            let onSuccessProcess: ExecChild | undefined
             let onSuccessCleanup: (() => any) | undefined | void
             /** Files imported by the entry */
             const buildDependencies: Set<string> = new Set()
@@ -347,11 +350,10 @@ export async function build(_options: Options) {
                 if (typeof options.onSuccess === 'function') {
                   onSuccessCleanup = await options.onSuccess()
                 } else {
-                  onSuccessProcess = execa(options.onSuccess, {
-                    shell: true,
-                    stdio: 'inherit',
+                  onSuccessProcess = exec(options.onSuccess, [], {
+                    nodeOptions: { shell: true, stdio: 'inherit' },
                   })
-                  onSuccessProcess.on('exit', (code) => {
+                  onSuccessProcess.process?.on('exit', (code) => {
                     if (code && code !== 0) {
                       process.exitCode = code
                     }
@@ -381,9 +383,7 @@ export async function build(_options: Options) {
                 typeof options.watch === 'boolean'
                   ? '.'
                   : Array.isArray(options.watch)
-                    ? options.watch.filter(
-                        (path): path is string => typeof path === 'string',
-                      )
+                    ? options.watch.filter((path) => typeof path === 'string')
                     : options.watch
 
               logger.info(
@@ -401,10 +401,10 @@ export async function build(_options: Options) {
                   .join(' | ')}`,
               )
 
-              const watcher = watch(watchPaths, {
+              const watcher = watch(await glob(watchPaths), {
                 ignoreInitial: true,
                 ignorePermissionErrors: true,
-                ignored,
+                ignored: (p) => globSync(p, { ignore: ignored }).length === 0,
               })
               watcher.on('all', async (type, file) => {
                 file = slash(file)
